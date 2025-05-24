@@ -144,48 +144,24 @@ class KokoroPhoneimzer:
         
         # Check if eSpeak-NG is available
         if not self.espeak_path:
-            print("Warning: eSpeak-NG not found. Phonemization will not be available.")
+            print("Error: Bundled eSpeak-NG not found. Phonemization is disabled.")
             global KOKORO_PHONEMIZER_AVAILABLE
             KOKORO_PHONEMIZER_AVAILABLE = False
-            print("Using fallback basic phonemization")
     
     def _find_espeak_path(self) -> Optional[str]:
-        """Find the path to the eSpeak-NG executable."""
-        # Common paths for eSpeak-NG
-        common_paths = [
-            r"C:\Program Files\eSpeak NG\espeak-ng.exe",
-            r"C:\Program Files (x86)\eSpeak NG\espeak-ng.exe",
-            "/usr/bin/espeak-ng",
-            "/usr/local/bin/espeak-ng"
-        ]
+        """Find the path to the bundled eSpeak-NG executable."""
+        # Get the directory of the current script (addon directory)
+        addon_dir = os.path.dirname(os.path.abspath(__file__))
         
-        # Check if espeak-ng is in PATH
-        try:
-            # Use 'where' on Windows, 'which' on Unix
-            if os.name == 'nt':  # Windows
-                result = subprocess.run(
-                    ["where", "espeak-ng"], 
-                    capture_output=True, 
-                    text=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW
-                )
-            else:  # Unix
-                result = subprocess.run(
-                    ["which", "espeak-ng"], 
-                    capture_output=True, 
-                    text=True
-                )
-            
-            if result.returncode == 0:
-                return result.stdout.strip().split('\n')[0]
-        except Exception as e:
-            print(f"Error checking for espeak-ng in PATH: {e}")
+        # Path to bundled espeak-ng.exe
+        bundled_espeak = os.path.join(addon_dir, "espeak", "espeak-ng.exe")
         
-        # Check common paths
-        for path in common_paths:
-            if os.path.exists(path):
-                return path
+        # Only use the bundled version
+        if os.path.exists(bundled_espeak):
+            print(f"Using bundled eSpeak-NG: {bundled_espeak}")
+            return bundled_espeak
         
+        print(f"Bundled eSpeak-NG not found at: {bundled_espeak}")
         return None
     
     def normalize_text(self, text: str) -> str:
@@ -251,7 +227,7 @@ class KokoroPhoneimzer:
     
     def phonemize(self, text: str) -> str:
         """
-        Convert text to phonemes using eSpeak-NG.
+        Convert text to phonemes using bundled eSpeak-NG.
         
         Args:
             text: Input text to phonemize
@@ -260,8 +236,7 @@ class KokoroPhoneimzer:
             Phonemized text
         """
         if not self.espeak_path:
-            print("Error during phonemization: eSpeak-NG not found")
-            return self._basic_phonemize(text)
+            raise RuntimeError("Bundled eSpeak-NG not found. Cannot phonemize text.")
         
         try:
             # Create a temporary file for the input text
@@ -269,10 +244,15 @@ class KokoroPhoneimzer:
                 f.write(text)
                 temp_filename = f.name
             
-            # Run eSpeak-NG with phoneme output
+            # Get the directory of the current script (addon directory)
+            addon_dir = os.path.dirname(os.path.abspath(__file__))
+            espeak_data_dir = os.path.join(addon_dir, "espeak", "espeak-ng-data")
+            
+            # Run eSpeak-NG with phoneme output using bundled data
             cmd = [
                 self.espeak_path,
                 "--ipa",
+                "--path", espeak_data_dir,
                 "-v", self.language,
                 "-q",  # Quiet mode
                 "-f", temp_filename
@@ -302,15 +282,13 @@ class KokoroPhoneimzer:
                 pass
             
             if process.returncode != 0:
-                print(f"Error during phonemization: {stderr}")
-                return self._basic_phonemize(text)
+                raise RuntimeError(f"eSpeak-NG error: {stderr}")
             
             # Process the output
             phonemes = stdout.strip() if stdout else ""
             
             if not phonemes:
-                print("No output from phonemizer, using fallback")
-                return self._basic_phonemize(text)
+                raise RuntimeError("No output from eSpeak-NG phonemizer")
             
             # Clean up the phonemes
             phonemes = self._clean_phonemes(phonemes)
@@ -318,16 +296,14 @@ class KokoroPhoneimzer:
             return phonemes
             
         except subprocess.TimeoutExpired:
-            print("Error during phonemization: Process timed out")
             # Kill the process if it's still running
             try:
                 process.kill()
             except:
                 pass
-            return self._basic_phonemize(text)
+            raise RuntimeError("eSpeak-NG process timed out")
         except Exception as e:
-            print(f"Error during phonemization: {e}")
-            return self._basic_phonemize(text)
+            raise RuntimeError(f"Error during phonemization: {e}")
     
     def _clean_phonemes(self, phonemes: str) -> str:
         """Clean up the phonemes output from eSpeak-NG."""
@@ -339,64 +315,6 @@ class KokoroPhoneimzer:
         
         return phonemes.strip()
     
-    def _basic_phonemize(self, text: str) -> str:
-        """
-        Basic phonemization for English when eSpeak-NG is not available.
-        This is a very simplified version and won't be as accurate.
-        
-        Args:
-            text: Input text to phonemize
-            
-        Returns:
-            Basic phonemized text
-        """
-        print("Falling back to basic phonemization")
-        
-        # Define a simple mapping for common English sounds
-        # This is very basic and won't handle many cases correctly
-        phoneme_map = {
-            'a': 'æ',
-            'e': 'ɛ',
-            'i': 'ɪ',
-            'o': 'ɑ',
-            'u': 'ʌ',
-            'th': 'θ',
-            'sh': 'ʃ',
-            'ch': 'tʃ',
-            'j': 'dʒ',
-            'ng': 'ŋ',
-            'ou': 'aʊ',
-            'ow': 'aʊ',
-            'oi': 'ɔɪ',
-            'ay': 'eɪ',
-            'ai': 'eɪ',
-            'ee': 'i',
-            'ea': 'i',
-            'oo': 'u',
-            'ar': 'ɑr',
-            'er': 'ɜr',
-            'ir': 'ɪr',
-            'or': 'ɔr',
-            'ur': 'ʊr',
-        }
-        
-        # Convert text to lowercase for processing
-        text = text.lower()
-        
-        # Replace digraphs first (two-letter combinations)
-        for digraph, phoneme in phoneme_map.items():
-            if len(digraph) > 1:
-                text = text.replace(digraph, phoneme)
-        
-        # Then replace single letters
-        result = ""
-        for char in text:
-            if char in phoneme_map and len(char) == 1:
-                result += phoneme_map[char]
-            else:
-                result += char
-        
-        return result
 
 
 # For testing
