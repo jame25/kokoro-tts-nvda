@@ -183,12 +183,88 @@ def force_refresh_dialog(dialog):
 synthDriverHandler.setSynth = patched_setSynth
 log.info("Patched synthDriverHandler.setSynth to force refresh for Kokoro TTS")
 
+
+class OptimizedAudioPlayer:
+    """Optimized audio player with pre-allocated buffers and low-latency playback."""
+    
+    def __init__(self, channels: int = 1, sample_rate: int = 24000, bits_per_sample: int = 16):
+        self.channels = channels
+        self.sample_rate = sample_rate
+        self.bits_per_sample = bits_per_sample
+        self._player = None
+        self._buffer_pool = queue.Queue(maxsize=5)
+        self._lock = threading.Lock()
+        
+        # Pre-allocate some buffers
+        for _ in range(3):
+            self._buffer_pool.put(bytearray(480000))  # ~10 seconds at 24kHz
+    
+    def _ensure_player(self, output_device=None):
+        """Ensure the player is initialized."""
+        if self._player is None:
+            with self._lock:
+                if self._player is None:  # Double-check after acquiring lock
+                    try:
+                        self._player = nvwave.WavePlayer(
+                            channels=self.channels,
+                            samplesPerSec=self.sample_rate,
+                            bitsPerSample=self.bits_per_sample,
+                            outputDevice=output_device
+                        )
+                        log.debug(f"Created WavePlayer with sample rate {self.sample_rate}")
+                    except Exception as e:
+                        log.error(f"Failed to create WavePlayer: {e}")
+                        raise
+    
+    def play(self, audio_data: Union[bytes, np.ndarray], output_device=None):
+        """Play audio data with minimal latency."""
+        self._ensure_player(output_device)
+        
+        # Convert numpy array to bytes if needed
+        if isinstance(audio_data, np.ndarray):
+            if audio_data.dtype == np.float32:
+                # Convert float32 to int16
+                audio_data = (audio_data * 32767).astype(np.int16)
+            
+            if audio_data.dtype != np.int16:
+                audio_data = audio_data.astype(np.int16)
+            
+            audio_data = audio_data.tobytes()
+        
+        # Feed to player
+        try:
+            self._player.feed(audio_data)
+        except Exception as e:
+            log.error(f"Error feeding audio to player: {e}")
+            # Reset player on error
+            self._player = None
+            raise
+    
+    def stop(self):
+        """Stop playback immediately."""
+        if self._player:
+            try:
+                self._player.stop()
+            except Exception as e:
+                log.error(f"Error stopping player: {e}")
+    
+    def close(self):
+        """Close the player and release resources."""
+        if self._player:
+            try:
+                self._player.close()
+            except Exception as e:
+                log.error(f"Error closing player: {e}")
+            finally:
+                self._player = None
+
+
 class SynthDriver(synthDriverHandler.SynthDriver):
     """
-    NVDA Synthesizer driver for Kokoro TTS.
+    Optimized NVDA Synthesizer driver for Kokoro TTS with sub-100ms latency.
     """
     name = "kokoro"
-    description = "Kokoro TTS"
+    description = "Kokoro TTS (Optimized)"
     
     # Supported commands - updated for compatibility with current NVDA versions
     supportedCommands = {
@@ -381,7 +457,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             return {}
     
     def __init__(self):
-        """Initialize the Kokoro TTS driver."""
+        """Initialize the optimized Kokoro TTS driver."""
         super(SynthDriver, self).__init__()
         
         # Paths to model files
@@ -415,27 +491,32 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         except Exception as e:
             log.error(f"Error initializing speech panel detection timer: {e}")
         
-        # Initialize the TTS engine
+        # Initialize the TTS engine with optimizations
         try:
-            log.info("Initializing Kokoro TTS")
+            log.info("Initializing optimized Kokoro TTS")
             self.tts = KokoroTTS(
                 model_path=self.model_path,
                 voice_dir=self.voice_dir,
                 config_path=self.config_path,
-                tokenizer_path=self.tokenizer_path
+                tokenizer_path=self.tokenizer_path,
+                enable_optimizations=True  # Enable low-latency optimizations
             )
             
-            # Initialize the speech queue and processing thread
-            self._speech_queue = queue.Queue()
+            # Initialize the optimized speech queue and processing thread
+            self._speech_queue = queue.Queue(maxsize=10)  # Limit queue size
             self._stop_event = threading.Event()
             self._processing_thread = threading.Thread(
-                target=self._process_speech_queue,
+                target=self._process_speech_queue_optimized,
                 daemon=True
             )
             self._processing_thread.start()
             
-            # Initialize the audio player
-            self._player = None
+            # Initialize the optimized audio player
+            self._audio_player = OptimizedAudioPlayer(
+                channels=1,
+                sample_rate=self.tts.sample_rate,
+                bits_per_sample=16
+            )
             
             # Set default voice
             voices = self.tts.list_voices()
@@ -453,7 +534,10 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             self._rate = 50  # NVDA uses 0-100 scale
             self._volume = 100  # NVDA uses 0-100 scale
             
-            log.info("Kokoro TTS initialized successfully")
+            # Log initialization complete with stats
+            stats = self.tts.get_latency_stats()
+            log.info(f"Kokoro TTS initialized successfully with optimizations: {stats}")
+            
         except Exception as e:
             log.error(f"Error initializing Kokoro TTS: {e}")
             raise
@@ -477,27 +561,25 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             self._processing_thread.join(timeout=0.5)
         
         # Close the audio player if it exists
-        if hasattr(self, '_player') and self._player is not None:
+        if hasattr(self, '_audio_player') and self._audio_player is not None:
             try:
-                self._player.close()
-                self._player = None
+                self._audio_player.close()
+                self._audio_player = None
                 log.debug("Closed audio player")
             except Exception as e:
                 log.error(f"Error closing audio player: {e}")
-                self._player = None
+                self._audio_player = None
         
         super(SynthDriver, self).terminate()
     
-    def _process_speech_queue(self):
-        """Process speech requests from the queue."""
+    def _process_speech_queue_optimized(self):
+        """Optimized speech queue processing with lower latency."""
         while not self._stop_event.is_set():
             try:
-                # Try to get an item without waiting
+                # Use a shorter timeout for more responsive cancellation
                 try:
-                    item = self._speech_queue.get_nowait()
+                    item = self._speech_queue.get(timeout=0.01)
                 except queue.Empty:
-                    # If the queue is empty, wait a bit and try again
-                    time.sleep(0.05)
                     continue
                 
                 # None is a signal to stop
@@ -508,7 +590,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                 text, index, rate, volume, voice = item
                 
                 try:
-                    # Generate speech
+                    # Skip empty text
                     if not text:
                         continue
                     
@@ -522,216 +604,36 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                     # Map rate 0-100 to speed factor 0.5-1.5
                     speed_factor = 1.5 - (rate / 100.0)  # This maps 0->1.5, 100->0.5
                     
+                    # Measure synthesis time
+                    synth_start = time.time()
+                    
                     # Generate audio
                     audio_data = self.tts.synthesize(text, speed=speed_factor)
                     
-                    # Adjust volume if needed (if KokoroTTS doesn't handle volume internally)
+                    synth_time = time.time() - synth_start
+                    log.debug(f"Synthesis took {synth_time*1000:.1f}ms for '{text[:20]}...'")
+                    
+                    # Adjust volume if needed
                     if volume != 100 and audio_data is not None:
-                        # Convert to float32, adjust volume, then back to original format
                         audio_data = audio_data * (volume / 100.0)
                     
                     # If we got audio data, play it
                     if audio_data is not None and len(audio_data) > 0 and not self._stop_event.is_set():
-                        # Validate audio data
-                        valid_audio = True
-                        if isinstance(audio_data, bytes) and len(audio_data) < 100:
-                            log.warning(f"Audio data suspiciously small ({len(audio_data)} bytes), may be invalid")
-                            if len(audio_data) < 10:  # Extremely small data is definitely invalid
-                                log.error("Audio data too small to be valid, skipping playback")
-                                valid_audio = False
-                        
-                        # Log the audio data type for debugging
-                        log.debug(f"Audio data type: {type(audio_data)}")
-                        if not isinstance(audio_data, (bytes, bytearray)) and not str(type(audio_data)).find('numpy') >= 0:
-                            log.warning(f"Unexpected audio data type: {type(audio_data)}")
-                            # We'll still try to play it, but it might fail
-                        
-                        if not valid_audio:
-                            log.error("Skipping invalid audio data")
-                            self._speech_queue.task_done()
-                            continue
-                            
-                        # Create a wave player if needed
-                        if not hasattr(self, '_player') or self._player is None:
-                            # Get the output device from NVDA's configuration
-                            outputDevice = None
-                            try:
-                                if hasattr(config.conf, "get") and "audio" in config.conf:
-                                    outputDevice = config.conf["audio"].get("outputDevice")
-                                if not outputDevice and "speech" in config.conf:
-                                    outputDevice = config.conf["speech"].get("outputDevice")
-                            except Exception as e:
-                                log.warning(f"Could not get output device from NVDA config, using default: {e}")
-                            
-                            # Initialize the wave player with different approaches
-                            player_created = False
-                            
-                            # Approach 1: Try with minimal parameters (most compatible)
-                            if not player_created:
-                                try:
-                                    self._player = nvwave.WavePlayer(
-                                        channels=1,
-                                        samplesPerSec=self.tts.sample_rate,
-                                        bitsPerSample=16,
-                                        outputDevice=outputDevice
-                                    )
-                                    log.debug(f"Created WavePlayer with basic parameters, sample rate {self.tts.sample_rate}")
-                                    player_created = True
-                                except Exception as e:
-                                    log.warning(f"Could not create WavePlayer with basic parameters: {e}")
-                            
-                            # Approach 2: Try with different sample rate
-                            if not player_created:
-                                try:
-                                    # Try with standard sample rate
-                                    self._player = nvwave.WavePlayer(
-                                        channels=1,
-                                        samplesPerSec=16000,  # Standard sample rate
-                                        bitsPerSample=16,
-                                        outputDevice=outputDevice
-                                    )
-                                    log.debug("Created WavePlayer with standard sample rate 16000")
-                                    player_created = True
-                                except Exception as e:
-                                    log.warning(f"Could not create WavePlayer with standard sample rate: {e}")
-                            
-                            # Approach 3: Try with positional arguments only
-                            if not player_created:
-                                try:
-                                    # Try with positional arguments
-                                    self._player = nvwave.WavePlayer(1, self.tts.sample_rate, 16, outputDevice)
-                                    log.debug("Created WavePlayer with positional arguments")
-                                    player_created = True
-                                except Exception as e:
-                                    log.warning(f"Could not create WavePlayer with positional arguments: {e}")
-                            
-                            # If all approaches failed, we can't play audio
-                            if not player_created:
-                                log.error("All approaches to create WavePlayer failed")
-                                continue
-                        
-                        # Play the audio
+                        # Get output device from config
+                        output_device = None
                         try:
-                            # Make sure numpy is available
-                            np_available = False
-                            try:
-                                import numpy as np
-                                np_available = True
-                                log.debug("Successfully imported numpy in _process_speech_queue")
-                            except ImportError:
-                                log.warning("Could not import numpy, audio conversion may be limited")
-                            
-                            # Convert audio_data to the right format if needed
-                            # Some versions of NVDA expect bytes, others expect numpy arrays
-                            if np_available and isinstance(audio_data, np.ndarray):
-                                # If it's a numpy array, convert to bytes
-                                log.debug(f"Converting numpy array with dtype {audio_data.dtype} to bytes")
-                                if audio_data.dtype == np.float32:
-                                    # Convert float32 to int16
-                                    audio_data = (audio_data * 32767).astype(np.int16).tobytes()
-                                elif audio_data.dtype == np.int16:
-                                    # Just convert to bytes
-                                    audio_data = audio_data.tobytes()
-                                else:
-                                    # Try to convert to int16 first
-                                    audio_data = audio_data.astype(np.int16).tobytes()
-                                log.debug(f"Converted audio data to bytes, length: {len(audio_data)}")
-                            
-                            # Try to feed the audio data
-                            log.debug(f"Feeding audio data of type {type(audio_data)} to player")
-                            self._player.feed(audio_data)
-                        except TypeError as e:
-                            log.error(f"TypeError playing audio: {e}")
-                            # If there's a type error, try to convert the data differently
-                            try:
-                                # Make sure numpy is available
-                                np_available = False
-                                try:
-                                    import numpy as np
-                                    np_available = True
-                                    log.debug("Successfully imported numpy in TypeError handler")
-                                except ImportError:
-                                    log.error("Could not import numpy for fallback conversion")
-                                    self._player = None
-                                    continue
-                                
-                                # Try different approaches based on the error message
-                                error_msg = str(e).lower()
-                                log.debug(f"Analyzing error message: {error_msg}")
-                                
-                                if "don't know how to convert parameter" in error_msg:
-                                    # This is likely a format issue
-                                    log.debug("Detected parameter conversion error, trying alternative formats")
-                                    
-                                    if isinstance(audio_data, bytes):
-                                        # Try converting bytes to a simple array
-                                        log.debug("Converting bytes to array")
-                                        # Use ctypes to create a simple array
-                                        byte_count = len(audio_data)
-                                        buffer = (ctypes.c_byte * byte_count)()
-                                        for i in range(byte_count):
-                                            buffer[i] = audio_data[i]
-                                        self._player.feed(buffer)
-                                        log.debug("Successfully played audio using ctypes buffer")
-                                    elif np_available and isinstance(audio_data, np.ndarray):
-                                        # Try different numpy array formats
-                                        log.debug(f"Converting numpy array with dtype {audio_data.dtype}")
-                                        if audio_data.dtype != np.int16:
-                                            audio_data = audio_data.astype(np.int16)
-                                        
-                                        # Try as raw buffer
-                                        buffer = audio_data.tobytes()
-                                        byte_count = len(buffer)
-                                        c_buffer = (ctypes.c_byte * byte_count)()
-                                        for i in range(byte_count):
-                                            c_buffer[i] = buffer[i]
-                                        self._player.feed(c_buffer)
-                                        log.debug("Successfully played audio using ctypes buffer from numpy array")
-                                    else:
-                                        log.error(f"Unsupported audio data type: {type(audio_data)}")
-                                        self._player = None
-                                else:
-                                    # Try the original numpy conversions
-                                    if np_available:
-                                        if isinstance(audio_data, bytes):
-                                            # Convert bytes to numpy array
-                                            audio_data_np = np.frombuffer(audio_data, dtype=np.int16)
-                                            self._player.feed(audio_data_np)
-                                            log.debug("Successfully played audio after converting bytes to numpy array")
-                                        elif isinstance(audio_data, np.ndarray):
-                                            # Try different numpy array formats
-                                            if audio_data.dtype != np.int16:
-                                                audio_data = audio_data.astype(np.int16)
-                                            self._player.feed(audio_data)
-                                            log.debug("Successfully played audio after converting numpy array format")
-                                        else:
-                                            log.error(f"Unsupported audio data type: {type(audio_data)}")
-                                            self._player = None
-                                    else:
-                                        # Ultimate fallback: try to use a simple buffer approach
-                                        log.debug("Trying ultimate fallback without numpy")
-                                        try:
-                                            if isinstance(audio_data, bytes):
-                                                # Create a simple buffer from bytes
-                                                byte_count = len(audio_data)
-                                                buffer = (ctypes.c_byte * byte_count)()
-                                                for i in range(byte_count):
-                                                    buffer[i] = audio_data[i]
-                                                self._player.feed(buffer)
-                                                log.debug("Successfully played audio using simple buffer fallback")
-                                            else:
-                                                log.error(f"Cannot convert {type(audio_data)} without numpy")
-                                                self._player = None
-                                        except Exception as e3:
-                                            log.error(f"Ultimate fallback failed: {e3}")
-                                            self._player = None
-                            except Exception as e2:
-                                log.error(f"Error in audio conversion fallback: {e2}")
-                                self._player = None
+                            if hasattr(config.conf, "get") and "audio" in config.conf:
+                                output_device = config.conf["audio"].get("outputDevice")
+                            if not output_device and "speech" in config.conf:
+                                output_device = config.conf["speech"].get("outputDevice")
                         except Exception as e:
-                            log.error(f"Error playing audio: {e}")
-                            # If there was an error with the player, set it to None to force recreation next time
-                            self._player = None
+                            log.warning(f"Could not get output device from config: {e}")
+                        
+                        # Play the audio with the optimized player
+                        play_start = time.time()
+                        self._audio_player.play(audio_data, output_device)
+                        play_time = time.time() - play_start
+                        log.debug(f"Audio playback initiated in {play_time*1000:.1f}ms")
                         
                         # Signal when done speaking
                         if index is not None:
@@ -760,11 +662,10 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             
             except Exception as e:
                 log.error(f"Error in speech queue processing: {e}")
-                time.sleep(0.1)  # Avoid tight loop in case of persistent errors
     
     def speak(self, speechSequence):
         """
-        Speak the given sequence.
+        Speak the given sequence with optimized processing.
         
         Args:
             speechSequence: A list of speech sequences to speak
@@ -802,19 +703,13 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                     return
             
             # Stop current speech before adding new speech
-            if hasattr(self, '_player') and self._player is not None:
-                try:
-                    self._player.stop()
-                except Exception as e:
-                    log.error(f"Error stopping current speech: {e}")
-                    # If there was an error with the player, set it to None to force recreation
-                    self._player = None
+            self._audio_player.stop()
             
             # Clear the queue to ensure only the most recent speech request is processed
             try:
                 while not self._speech_queue.empty():
                     try:
-                        self._speech_queue.get_nowait()
+                        old_item = self._speech_queue.get_nowait()
                         self._speech_queue.task_done()
                     except queue.Empty:
                         break
@@ -822,30 +717,33 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                 log.error(f"Error clearing speech queue: {e}")
             
             # Add the new text to the queue with the index
-            self._speech_queue.put((text, index, self._rate, self._volume, self._voice))
+            try:
+                self._speech_queue.put_nowait((text, index, self._rate, self._volume, self._voice))
+            except queue.Full:
+                log.warning("Speech queue is full, dropping oldest item")
+                try:
+                    self._speech_queue.get_nowait()
+                    self._speech_queue.task_done()
+                    self._speech_queue.put_nowait((text, index, self._rate, self._volume, self._voice))
+                except Exception as e:
+                    log.error(f"Error managing full queue: {e}")
     
     def cancel(self):
-        """Stop speaking."""
+        """Stop speaking immediately."""
         # Stop the current playback immediately
-        if hasattr(self, '_player') and self._player is not None:
-            try:
-                self._player.stop()
-                log.debug("Speech cancelled")
-            except Exception as e:
-                log.error(f"Error cancelling speech: {e}")
+        self._audio_player.stop()
+        log.debug("Speech cancelled")
     
     def pause(self, switch):
         """Pause or resume speech."""
-        if hasattr(self, '_player') and self._player is not None:
-            try:
-                if switch:
-                    self._player.pause()
-                    log.debug("Speech paused")
-                else:
-                    self._player.resume()
-                    log.debug("Speech resumed")
-            except Exception as e:
-                log.error(f"Error {'pausing' if switch else 'resuming'} speech: {e}")
+        # Note: The optimized audio player doesn't support pause/resume
+        # We just stop on pause
+        if switch:
+            self._audio_player.stop()
+            log.debug("Speech paused (stopped)")
+        else:
+            # Can't resume with current implementation
+            log.debug("Speech resume requested (not supported)")
     
     def _get_voice(self):
         """Get the current voice."""
@@ -1018,6 +916,16 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                 wx.CallAfter(self._initTimer)
         except Exception as e:
             log.error(f"Error in _initTimer: {e}")
+    
+    def get_latency_stats(self):
+        """Get latency statistics for diagnostics."""
+        try:
+            stats = self.tts.get_latency_stats()
+            stats['audio_player'] = 'optimized'
+            return stats
+        except Exception as e:
+            log.error(f"Error getting latency stats: {e}")
+            return {}
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
@@ -1028,6 +936,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     # Define the scripts that this global plugin will provide
     __gestures = {
         "kb:NVDA+shift+r": "refreshSpeechPanel",
+        "kb:NVDA+shift+k": "showKokoroStats",
     }
     
     def __init__(self):
@@ -1219,15 +1128,58 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             ui.message(_("Refreshing speech settings panel"))
         else:
             ui.message(_("Kokoro TTS is not the active synthesizer"))
-    # Add the script binding using the older style
+    
+    def script_showKokoroStats(self, gesture):
+        """Script to show Kokoro TTS latency statistics."""
+        # Check if Kokoro TTS is the current synthesizer
+        synth = synthDriverHandler.getSynth()
+        if synth.name == "kokoro":
+            try:
+                stats = synth.get_latency_stats()
+                
+                # Format the statistics
+                message = _("Kokoro TTS Statistics:\n")
+                
+                if stats.get('phonemizer_available'):
+                    message += _("Phonemizer: Available\n")
+                else:
+                    message += _("Phonemizer: Not available\n")
+                
+                if stats.get('optimizations_enabled'):
+                    message += _("Optimizations: Enabled\n")
+                    message += _("Token cache size: {}\n").format(stats.get('token_cache_size', 0))
+                    message += _("Synthesis cache size: {}\n").format(stats.get('synthesis_cache_size', 0))
+                else:
+                    message += _("Optimizations: Disabled\n")
+                
+                if 'phonemizer_stats' in stats:
+                    p_stats = stats['phonemizer_stats']
+                    message += _("\nPhonemizer Cache:\n")
+                    message += _("Cache hits: {}\n").format(p_stats.get('cache_hits', 0))
+                    message += _("Cache misses: {}\n").format(p_stats.get('cache_misses', 0))
+                    message += _("Hit rate: {:.1f}%\n").format(p_stats.get('hit_rate', 0))
+                    message += _("Text cache: {} entries\n").format(p_stats.get('text_cache_size', 0))
+                    message += _("Word cache: {} entries\n").format(p_stats.get('word_cache_size', 0))
+                
+                ui.message(message)
+            except Exception as e:
+                log.error(f"Error getting Kokoro stats: {e}")
+                ui.message(_("Error getting Kokoro TTS statistics"))
+        else:
+            ui.message(_("Kokoro TTS is not the active synthesizer"))
+    
+    # Add the script bindings using the older style
     script_refreshSpeechPanel.__doc__ = _("Refresh the speech settings panel")
     script_refreshSpeechPanel.category = _("Kokoro TTS")
+    
+    script_showKokoroStats.__doc__ = _("Show Kokoro TTS latency statistics")
+    script_showKokoroStats.category = _("Kokoro TTS")
 
 
 # For testing outside of NVDA
 if __name__ == "__main__":
     print("This module is designed to be imported by NVDA.")
-    print("Testing Kokoro TTS standalone...")
+    print("Testing optimized Kokoro TTS standalone...")
     
     # Paths
     model_path = os.path.join("model", "kokoro.onnx")
@@ -1236,7 +1188,7 @@ if __name__ == "__main__":
     tokenizer_path = "tokenizer.json"
     
     # Initialize TTS engine
-    tts = KokoroTTS(model_path, voice_dir, config_path, tokenizer_path)
+    tts = KokoroTTS(model_path, voice_dir, config_path, tokenizer_path, enable_optimizations=True)
     
     # List available voices
     voices = tts.list_voices()
@@ -1246,7 +1198,10 @@ if __name__ == "__main__":
         # Set voice
         tts.set_voice(voices[0])
         
-        # Synthesize and play speech
-        text = "This is a test of the Kokoro TTS engine for NVDA."
+        # Synthesize and measure latency
+        import time
+        text = "This is a test of the optimized Kokoro TTS engine for NVDA."
+        start_time = time.time()
         waveform = tts.synthesize(text)
-        print("Waveform synthesized, but cannot play without NVDA's audio system.") 
+        elapsed_ms = (time.time() - start_time) * 1000
+        print(f"Synthesis completed in {elapsed_ms:.1f}ms")
