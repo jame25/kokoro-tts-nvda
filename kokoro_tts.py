@@ -51,9 +51,9 @@ class KokoroTTS:
                 print(f"Using custom phonemizer with language: {language}")
             except Exception as e:
                 print(f"Error initializing phonemizer: {e}")
-                print("Falling back to character-based tokenization")
+                raise RuntimeError(f"Failed to initialize phonemizer: {e}")
         else:
-            print("Phonemizer not available. Using fallback character-based tokenization.")
+            raise RuntimeError("Phonemizer not available. Cannot initialize TTS without eSpeak-NG.")
         
         # Initialize ONNX runtime session with CPU provider
         self.session = ort.InferenceSession(
@@ -184,13 +184,9 @@ class KokoroTTS:
                 print(f"Successfully phonemized text: {text[:50]}{'...' if len(text) > 50 else ''}")
                 return phonemized
             except Exception as e:
-                print(f"Error during phonemization: {e}")
-                # Fall back to the original text if phonemization fails
-                return text
+                raise RuntimeError(f"Phonemization failed: {e}")
         
-        # Fallback to the original text if phonemizer is not available
-        print("Phonemizer not available, using original text")
-        return text
+        raise RuntimeError("Phonemizer not available")
     
     def _normalize_raw_text(self, text: str) -> str:
         """
