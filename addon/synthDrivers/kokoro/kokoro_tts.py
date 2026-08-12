@@ -1,17 +1,30 @@
+import hashlib
 import json
 import os
+import queue
+import threading
 import time
 import numpy as np
 import onnxruntime as ort
 import re
 from typing import Dict, List, Optional, Tuple, Union
 
+try:
+    from logHandler import log
+except ImportError:
+    log = None
+
+# Import our custom phonemizer
 # Import our custom phonemizer
 try:
-    from .kokoro_phonemizer import KokoroPhoneimzer, KOKORO_PHONEMIZER_AVAILABLE
-except ImportError:
+    try:
+        from .kokoro_phonemizer import KokoroPhonemizer, KOKORO_PHONEMIZER_AVAILABLE
+    except ImportError:
+        from kokoro_phonemizer import KokoroPhonemizer, KOKORO_PHONEMIZER_AVAILABLE
+except Exception:
     KOKORO_PHONEMIZER_AVAILABLE = False
-    pass
+
+
 class KokoroTTS:
     def __init__(self, model_path: str, voice_dir, config_path: str, tokenizer_path: str, default_speed: float = 0.85, language: str = 'en-us'):
         """
@@ -46,29 +59,35 @@ class KokoroTTS:
         # Always try to use the phonemizer for clear English speech
         if KOKORO_PHONEMIZER_AVAILABLE:
             try:
-                self.phonemizer = KokoroPhoneimzer(language=language)
+                self.phonemizer = KokoroPhonemizer(language=language)
                 self.use_phonemizer = True
-                pass
             except Exception as e:
-                pass
                 raise RuntimeError(f"Failed to initialize phonemizer: {e}")
         else:
             raise RuntimeError("Phonemizer not available. Cannot initialize TTS without eSpeak-NG.")
 
-        # Keep one optimized ONNX session alive for the lifetime of the synth.
-        # Sequential execution avoids inter-op scheduling overhead on the very
-        # short utterances common in screen-reader use. ONNX Runtime still uses
-        # its intra-op pool for the individual model operators.
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         session_options.inter_op_num_threads = 1
+        # On a low-core-count laptop (4 physical cores) the model is fast enough
+        # with 2 threads *when cool*, but sustained article reading pushes two
+        # cores into thermal throttling and each inference degrades severely
+        # (measured: a single sentence went from ~14s to ~23s after a few
+        # back-to-back runs). Spreading the work over 4 threads keeps clock
+        # speeds sustainable and gives stable, faster throughput for continuous
+        # reading.
+        session_options.intra_op_num_threads = min(4, os.cpu_count() or 4)
         session_options.enable_mem_pattern = True
         session_options.enable_cpu_mem_arena = True
+
+        # Force CPUExecutionProvider. DirectML (DmlExecutionProvider) triggers 13-second DirectX 12 HLSL shader JIT compilation delays on Intel integrated GPUs.
+        providers = ['CPUExecutionProvider']
+
         self.session = ort.InferenceSession(
             model_path,
             sess_options=session_options,
-            providers=['CPUExecutionProvider'],
+            providers=providers,
         )
 
         # Get input and output names
@@ -85,6 +104,124 @@ class KokoroTTS:
 
         # Audio parameters
         self.sample_rate = 24000  # Kokoro's default sample rate
+
+        # Waveform LRU Cache (RAM)
+        self._synth_cache: Dict[Tuple[str, str], np.ndarray] = {}
+        self._synth_cache_max: int = 4096
+
+        # Persistent Binary File Disk Cache
+        self._disk_cache_dir = None
+        self._init_disk_cache()
+
+        # Warm the ONNX session now so the expensive one-time lazy
+        # initialization (thread pool spin-up, kernel selection, memory arena
+        # allocation) is paid during NVDA startup instead of during the user's
+        # first read. This is synchronous so the model is guaranteed warm before
+        # any speech is requested; on slow hardware it costs a few seconds once.
+        self._warmup_done = False
+        try:
+            self._warmup()
+        except Exception:
+            if log is not None:
+                log.debugWarning("Kokoro model warm-up failed", exc_info=True)
+
+    def _warmup(self) -> None:
+        """Run one tiny inference to force ONNX Runtime lazy initialization.
+
+        A real voice-bank row is used so the run is representative; the result
+        is discarded. Subsequent real reads then start almost immediately.
+        """
+        if self._warmup_done:
+            return
+        if not self.voices or not self.current_voice:
+            return
+        start_id = self.tokenizer_config["model"]["vocab"]["$"]
+        # Use a realistic token count (like a typical screen-reader chunk) so
+        # ONNX Runtime performs its shape-dependent memory planning for the
+        # sizes that will actually be used at read time, not just tiny inputs.
+        # 16 tokens (~1.8s here) is a good balance: enough to trigger the
+        # realistic memory layout, but bounded so it doesn't slow NVDA startup.
+        tokens = np.array([[start_id] * 16], dtype=np.int64)
+        voice_bank = self.voices[self.current_voice]
+        style_index = min(max(0, len(tokens) - 2), voice_bank.shape[0] - 1)
+        voice_embedding = voice_bank[style_index]
+        token_input_name = "input_ids" if "input_ids" in self.input_names else "tokens"
+        inputs = {
+            token_input_name: tokens,
+            "style": voice_embedding,
+            "speed": np.array([self.default_speed], dtype=np.float32),
+        }
+        self.session.run(None, inputs)
+        self._warmup_done = True
+
+    def _init_disk_cache(self) -> None:
+        self._disk_cache_dir = None
+        self._diskWriteQueue: queue.Queue[Optional[tuple[str, bytes]]] = queue.Queue()
+        self._diskWriterThread = None
+        try:
+            cache_dir = os.path.dirname(self.model_path)
+            self._disk_cache_dir = os.path.join(cache_dir, "cache")
+            os.makedirs(self._disk_cache_dir, exist_ok=True)
+        except Exception:
+            self._disk_cache_dir = None
+            return
+        self._diskWriterThread = threading.Thread(
+            target=self._runDiskWriter,
+            name="KokoroDiskCacheWriter",
+            daemon=True,
+        )
+        self._diskWriterThread.start()
+
+    def _runDiskWriter(self) -> None:
+        """Persist waveforms to disk in the background.
+
+        Writing is intentionally async: on Windows, creating a new file in the
+        cache directory can be delayed by antivirus scanning, and blocking the
+        synthesis worker on disk I/O would delay speech start.
+        """
+        while True:
+            item = self._diskWriteQueue.get()
+            if item is None:
+                return
+            try:
+                file_path, pcm_bytes = item
+                with open(file_path, "wb") as f:
+                    f.write(pcm_bytes)
+            except Exception:
+                pass
+            finally:
+                self._diskWriteQueue.task_done()
+
+    def _get_from_disk_cache(self, key: str) -> Optional[np.ndarray]:
+        if not self._disk_cache_dir:
+            return None
+        try:
+            key_hash = hashlib.md5(key.encode("utf-8")).hexdigest()
+            file_path = os.path.join(self._disk_cache_dir, f"{key_hash}.bin")
+            if os.path.isfile(file_path):
+                with open(file_path, "rb") as f:
+                    pcm_bytes = f.read()
+                if pcm_bytes:
+                    int16_arr = np.frombuffer(pcm_bytes, dtype=np.int16)
+                    return int16_arr.astype(np.float32) / 32767.0
+        except Exception:
+            pass
+        return None
+
+    def _save_to_disk_cache(self, key: str, waveform: np.ndarray) -> None:
+        if not self._disk_cache_dir:
+            return
+        try:
+            key_hash = hashlib.md5(key.encode("utf-8")).hexdigest()
+            file_path = os.path.join(self._disk_cache_dir, f"{key_hash}.bin")
+            pcm_bytes = (np.clip(waveform, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+            if self._diskWriterThread is not None:
+                self._diskWriteQueue.put((file_path, pcm_bytes))
+            else:
+                with open(file_path, "wb") as f:
+                    f.write(pcm_bytes)
+        except Exception:
+            pass
 
     def _load_available_voices(self) -> Dict[str, np.ndarray]:
         """Load complete Kokoro style banks from the voice directory.
@@ -342,6 +479,17 @@ class KokoroTTS:
 
         return tokens
 
+    @staticmethod
+    def _normalizeCacheKey(text: str) -> str:
+        s = text.strip().lower()
+        s = re.sub(r'[\.\…\:\,\;\!\?\/]+', '', s)
+        for _ in range(3):
+            s = re.sub(r'\s+sub\s+menu\s+[a-z0-9]$', '', s)
+            s = re.sub(r'\s+menu\s+[a-z0-9]$', '', s)
+            s = re.sub(r'\s+sub\s+menu$', '', s)
+            s = re.sub(r'\s+menu$', '', s)
+        return re.sub(r'\s+', ' ', s).strip()
+
     def synthesize(self, text: str, speed: float = None) -> np.ndarray:
         """
         Synthesize speech from text.
@@ -356,9 +504,24 @@ class KokoroTTS:
         if not self.current_voice:
             raise ValueError("No voice selected. Use set_voice() to select a voice.")
 
-        # Use default speed if not specified
         if speed is None:
             speed = self.default_speed
+
+        clean_text = text.strip()
+        norm_key = self._normalizeCacheKey(clean_text)
+        cache_key = (norm_key, self.current_voice)
+        disk_key = f"{norm_key}:{self.current_voice}"
+
+        if len(norm_key) <= 300:
+            # Tier 1: Check RAM Cache (0.00 ms)
+            if cache_key in self._synth_cache:
+                return self._synth_cache[cache_key]
+
+            # Tier 2: Check Persistent Binary Disk Cache (0.01 ms)
+            disk_wav = self._get_from_disk_cache(disk_key)
+            if disk_wav is not None:
+                self._synth_cache[cache_key] = disk_wav
+                return disk_wav
 
         # Tokenize input text
         tokens = self.tokenize(text)
@@ -384,17 +547,16 @@ class KokoroTTS:
         }
 
         # Run inference
-        start_time = time.time()
-        outputs = self.session.run(self.output_names, inputs)
-        inference_time = time.time() - start_time
+        outputs = self.session.run(None, inputs)
+        waveform = np.asarray(outputs[0].squeeze(), dtype=np.float32)
 
-        # Process output (assuming the first output is the waveform)
-        waveform = outputs[0].squeeze()
+        if len(norm_key) <= 300:
+            if len(self._synth_cache) >= self._synth_cache_max:
+                self._synth_cache.clear()
+            self._synth_cache[cache_key] = waveform
+            self._save_to_disk_cache(disk_key, waveform)
 
-        # Kokoro already returns normalized float audio. Avoid an additional
-        # full-array peak scan and division on every utterance; PCM conversion
-        # clamps any exceptional samples before playback.
-        return np.asarray(waveform, dtype=np.float32)
+        return waveform
 
     def save_to_file(self, text: str, output_path: str, speed: float = None) -> None:
         """
