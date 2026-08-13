@@ -123,6 +123,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         self._generation = 0
         self._generationLock = threading.Lock()
         self._inferenceLock = threading.Lock()
+        self._playerLock = threading.Lock()
         self._speechQueue: queue.Queue[_Utterance | None] = queue.Queue()
         self._audioQueue: queue.Queue[_AudioPacket | None] = queue.Queue()
         self._stopEvent = threading.Event()
@@ -136,6 +137,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         )
         self._dataDir = os.path.join(globalVars.appArgs.configPath, "kokoroTTS")
         self._userVoiceDir = os.path.join(self._dataDir, "voices")
+        self._disk_cache_dir = os.path.join(self._dataDir, "model", "cache")
         # Building the ONNX session and warming it up costs several seconds on a
         # low-power laptop (thread pool spin-up, kernel selection, arena
         # allocation) and previously blocked NVDA's main thread at startup.
@@ -165,11 +167,35 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             daemon=True,
         )
         self._initThread.start()
-        threading.Thread(
-            target=self._precacheCommonLabels,
-            name="KokoroPrecache",
-            daemon=True,
-        ).start()
+
+    def _getFromFastDiskCache(self, text: str, voice: str, volume: int) -> bytes | None:
+        """Instant Tier-0 cache lookup directly from disk without requiring ONNX model initialization."""
+        if not self._disk_cache_dir or not os.path.isdir(self._disk_cache_dir):
+            return None
+        clean_text = text.strip()
+        norm_key = re.sub(r'[\.\…\:\,\;\!\?\/]+', ' ', clean_text.lower())
+        norm_key = re.sub(r'\s+', ' ', norm_key).strip()
+        if not norm_key:
+            norm_key = clean_text.lower()
+        if not norm_key or len(norm_key) > 300:
+            return None
+        disk_key = f"{norm_key}:{voice}"
+        try:
+            key_hash = hashlib.md5(disk_key.encode("utf-8")).hexdigest()
+            file_path = os.path.join(self._disk_cache_dir, f"{key_hash}.bin")
+            if os.path.isfile(file_path):
+                with open(file_path, "rb") as f:
+                    raw_pcm = f.read()
+                if raw_pcm:
+                    if volume == 100:
+                        return raw_pcm
+                    import numpy as np
+                    data = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
+                    data = np.clip(data * (max(0, min(100, volume)) / 100.0), -32767.0, 32767.0)
+                    return data.astype(np.int16).tobytes()
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _scanVoiceFiles(voiceDir: str) -> list[str]:
@@ -185,21 +211,27 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         return sorted(names)
 
     @staticmethod
-    def _setThreadBelowNormal() -> None:
-        """Lower worker thread priority so the NVDA main thread and its
-        watchdog are never starved of CPU while inference runs on a low
-        core-count laptop."""
+    def _setThreadPriority(priority: int) -> None:
+        """Set thread priority for current thread (-1 = BELOW_NORMAL, 0 = NORMAL)."""
         try:
             k32 = ctypes.windll.kernel32
             k32.GetCurrentThread.restype = ctypes.c_void_p
             k32.SetThreadPriority.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            # THREAD_PRIORITY_BELOW_NORMAL
-            k32.SetThreadPriority(k32.GetCurrentThread(), -1)
+            k32.SetThreadPriority(k32.GetCurrentThread(), priority)
         except Exception:
             pass
 
+    @classmethod
+    def _setThreadBelowNormal(cls) -> None:
+        cls._setThreadPriority(-1)
+
+    @classmethod
+    def _setThreadNormal(cls) -> None:
+        cls._setThreadPriority(0)
+
     def _initTTS(self) -> None:
         self._setThreadBelowNormal()
+        init_t0 = time.perf_counter()
         try:
             for attempt in range(2):
                 if self._stopEvent.is_set():
@@ -221,7 +253,13 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                         self._voice = voices[0]
                     if self._voice in voices:
                         tts.set_voice(self._voice)
+                    # Warm up ONNX Runtime lazily inside the background init thread before ready signal
+                    try:
+                        tts._warmup()
+                    except Exception:
+                        log.debugWarning("Kokoro background warm-up failed", exc_info=True)
                     self._tts = tts
+                    log.info(f"Kokoro model loaded and warmed in {time.perf_counter() - init_t0:.2f}s")
                     return
                 except Exception:
                     # Transient failures (antivirus locking the model file,
@@ -232,17 +270,33 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         finally:
             self._ready.set()
 
+    @staticmethod
+    def _getDesktopShortcutLabels() -> list[str]:
+        labels = []
+        try:
+            desktop_dirs = [
+                os.path.join(os.path.expanduser("~"), "Desktop"),
+                os.path.join(os.environ.get("PUBLIC", r"C:\Users\Public"), "Desktop"),
+            ]
+            for d in desktop_dirs:
+                if os.path.isdir(d):
+                    for f in os.listdir(d):
+                        if f.lower().endswith(".lnk"):
+                            name = os.path.splitext(f)[0].strip()
+                            if name and name not in labels:
+                                labels.append(name)
+        except Exception:
+            pass
+        return labels
+
     def _precacheCommonLabels(self) -> None:
-        # The ONNX session is created in the background; don't run inference
-        # concurrently with its own warm-up.
+        # Wait for model ready, then wait 10s so NVDA startup completes completely
         self._ready.wait()
-        if self._stopEvent.is_set():
-            return
-        # Precache only the handful of labels NVDA speaks during normal startup
-        # and menu navigation. A larger list saturates the CPU of a low-power
-        # laptop for many minutes (each label is ~2s of inference here) and
-        # triggers NVDA's watchdog freeze recovery. Everything else is cached
-        # to disk on first use and is effectively instant afterwards.
+        for _ in range(100):
+            if self._stopEvent.is_set():
+                return
+            time.sleep(0.1)
+
         common_labels = (
             "NVDA", "Desktop", "Taskbar", "Start menu",
             "OK", "Cancel", "Close", "Apply",
@@ -250,28 +304,30 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             "View log", "Tools", "Help", "Menu",
             "File", "Edit",
         )
+
         for label in common_labels:
             if self._stopEvent.is_set():
                 break
-            # Wait until the user has no queued synthesis work AND the tail of
-            # any current playback has drained, so precaching never steals CPU
-            # from speech that is still being heard.
+            # Wait until the user has no queued synthesis work AND playback is idle
             while (
                 self._isSpeakingEvent.is_set()
                 or not self._speechQueue.empty()
                 or not self._audioQueue.empty()
             ) and not self._stopEvent.is_set():
-                time.sleep(0.2)
+                time.sleep(0.5)
             if self._stopEvent.is_set() or self._tts is None:
                 break
+            if self._isSpeakingEvent.is_set() or not self._speechQueue.empty():
+                continue
             try:
                 # Serialize with the synthesis worker so the two threads never
                 # run ONNX inference simultaneously.
                 with self._inferenceLock:
-                    self._tts.synthesize(label, speed=self._speedForRate(self._rate))
+                    if not self._isSpeakingEvent.is_set() and self._speechQueue.empty():
+                        self._tts.synthesize(label, speed=self._speedForRate(self._rate))
             except Exception:
                 pass
-            time.sleep(0.1)  # Yield CPU to keep the system responsive
+            time.sleep(1.0)  # Generous yield so CPU stays cool and watchdog is never triggered
 
     def terminate(self):
         self.cancel()
@@ -288,7 +344,8 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         if initThread is not None and initThread.is_alive():
             initThread.join(timeout=1.0)
         try:
-            self._player.close()
+            with self._playerLock:
+                self._player.close()
         finally:
             super().terminate()
 
@@ -316,7 +373,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         return 0.5 + (max(0, min(100, rate)) * 1.5 / 100.0)
 
     @staticmethod
-    def _toPcm16(audio, volume: int, trim_tail: bool = False) -> bytes:
+    def _toPcm16(audio, volume: int, trim_leading: bool = False, trim_tail: bool = False) -> bytes:
         import numpy as np
 
         data = np.asarray(audio, dtype=np.float32)
@@ -324,61 +381,87 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             data = data.reshape(-1)
         data = np.nan_to_num(data, nan=0.0, posinf=1.0, neginf=-1.0)
 
-        if trim_tail and len(data) > 1000:
+        if len(data) > 480:
             abs_data = np.abs(data)
-            last_sound = len(data) - 1 - np.argmax(abs_data[::-1] > 0.01)
-            keep_len = min(len(data), last_sound + 720)  # 30ms natural soft fade
-            data = data[:keep_len]
+            above_thresh = abs_data > 0.008
+
+            if np.any(above_thresh):
+                first_sound = int(np.argmax(above_thresh))
+                last_sound = len(data) - 1 - int(np.argmax(above_thresh[::-1]))
+
+                start_pos = max(0, first_sound - 240) if trim_leading else 0
+                end_pos = min(len(data), last_sound + (240 if trim_tail else 720))
+
+                if start_pos < end_pos:
+                    data = data[start_pos:end_pos]
 
         data = np.clip(data * (max(0, min(100, volume)) / 100.0), -1.0, 1.0)
         return (data * 32767.0).astype(np.int16).tobytes()
 
     @staticmethod
-    def _chunkText(text: str, max_first_chars: int = 15, max_chars: int = 45) -> list[tuple[str, int, int]]:
+    def _chunkText(text: str, max_subsequent_chars: int = 160) -> list[tuple[str, int, int]]:
         if not text:
             return []
 
-        # If the text has NVDA multi-space separators (\s{2,}), split on them first (UI control focus sequences)
-        if '  ' in text:
-            raw_parts = re.split(r'(\s{2,})', text)
-            chunks = []
-            curr_pos = 0
-            for part in raw_parts:
-                p_strip = part.strip()
-                if p_strip:
-                    c_start = text.find(p_strip, curr_pos)
-                    if c_start == -1:
-                        c_start = curr_pos
-                    c_end = c_start + len(p_strip)
-                    chunks.append((p_strip, c_start, c_end))
-                    curr_pos = c_end
-            return chunks if chunks else [(text, 0, len(text))]
+        clean_stripped = text.strip()
 
-        # Split continuous sentences by major punctuation marks
-        clauses = [c.strip() for c in re.split(r'([,.;!?\:\—\–\n]+)', text) if c.strip()]
+        # Split by natural punctuation marks (, . ; : ! ? — – \n \t) or multi-space delimiters
+        clauses = [c.strip() for c in re.split(r'([,.;!?:—–\n\t]+|\s{2,})', text) if c.strip()]
         merged_clauses = []
         i = 0
         while i < len(clauses):
-            clause = clauses[i]
-            if i + 1 < len(clauses) and clauses[i+1] in (',', '.', ';', ':', '!', '?', '—', '–', '-'):
-                clause += clauses[i+1]
+            c = clauses[i]
+            if i + 1 < len(clauses) and clauses[i+1] in (',', '.', ';', ':', '!', '?', '—', '–'):
+                c += clauses[i+1]
                 i += 2
             else:
                 i += 1
-            merged_clauses.append(clause)
+            merged_clauses.append(c)
+
+        if not merged_clauses:
+            return [(clean_stripped, 0, len(text))]
 
         final_chunks = []
-        curr_str = ''
         sub_start = 0
+
+        # Chunk 0: The first natural clause ending at the first comma (,) or full stop (.) / punctuation mark!
+        first_clause = merged_clauses[0]
         CONJUNCTION_PATTERN = re.compile(
-            r'^\b(that|which|before|after|because|although|while|where|when|since|unless|until|and|but|or|so|with|to|in|on|at|by|for|from|he|she|it|they|of)\b$',
+            r'^\b(that|which|before|after|because|although|while|where|when|since|unless|until|and|but|or|so|with|to|in|on|at|by|for|from|including|instead|without)\b$',
             re.IGNORECASE,
         )
 
-        for clause in merged_clauses:
-            target_limit = max_first_chars if len(final_chunks) == 0 and not curr_str else max_chars
-            if len(curr_str) + len(clause) + (1 if curr_str else 0) <= target_limit:
-                curr_str += (' ' if curr_str else '') + clause
+        # If the first clause is extraordinarily long (> 160 chars with no punctuation), split at a conjunction
+        if len(first_clause) > max_subsequent_chars:
+            words = first_clause.split(' ')
+            sub_words = []
+            sub_len = 0
+            for w in words:
+                clean_w = re.sub(r'[\W_]+', '', w)
+                space_len = 1 if sub_words else 0
+                if sub_len >= 30 and CONJUNCTION_PATTERN.match(clean_w):
+                    break
+                sub_words.append(w)
+                sub_len += len(w) + space_len
+            c0_str = ' '.join(sub_words) if sub_words else first_clause
+            rem_first = first_clause[len(c0_str):].strip()
+            subsequent_clauses = ([rem_first] if rem_first else []) + merged_clauses[1:]
+        else:
+            c0_str = first_clause
+            subsequent_clauses = merged_clauses[1:]
+
+        c_start = text.find(c0_str, sub_start)
+        if c_start == -1:
+            c_start = sub_start
+        c_end = c_start + len(c0_str)
+        final_chunks.append((c0_str, c_start, c_end))
+        sub_start = c_end
+
+        # Group subsequent clauses into full, continuous compound sentences (up to 160 chars)
+        curr_str = ''
+        for cl in subsequent_clauses:
+            if len(curr_str) + len(cl) + (1 if curr_str else 0) <= max_subsequent_chars:
+                curr_str += (' ' if curr_str else '') + cl
             else:
                 if curr_str:
                     c_start = text.find(curr_str, sub_start)
@@ -388,45 +471,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                     final_chunks.append((curr_str, c_start, c_end))
                     sub_start = c_end
                     curr_str = ''
-
-                curr_limit = max_first_chars if len(final_chunks) == 0 else max_chars
-                if len(clause) > curr_limit:
-                    words = clause.split(' ')
-                    sub_words = []
-                    sub_len = 0
-                    for w in words:
-                        clean_w = re.sub(r'[\W_]+', '', w)
-                        curr_limit = max_first_chars if len(final_chunks) == 0 else max_chars
-                        space_len = 1 if sub_words else 0
-
-                        if sub_len + len(w) + space_len > curr_limit and sub_words:
-                            sub_str = ' '.join(sub_words)
-                            c_start = text.find(sub_str, sub_start)
-                            if c_start == -1:
-                                c_start = sub_start
-                            c_end = c_start + len(sub_str)
-                            final_chunks.append((sub_str, c_start, c_end))
-                            sub_start = c_end
-                            sub_words = [w]
-                            sub_len = len(w)
-                        elif sub_len > 25 and CONJUNCTION_PATTERN.match(clean_w):
-                            sub_str = ' '.join(sub_words)
-                            c_start = text.find(sub_str, sub_start)
-                            if c_start == -1:
-                                c_start = sub_start
-                            c_end = c_start + len(sub_str)
-                            final_chunks.append((sub_str, c_start, c_end))
-                            sub_start = c_end
-                            sub_words = [w]
-                            sub_len = len(w)
-                        else:
-                            sub_words.append(w)
-                            sub_len += len(w) + space_len
-                    if sub_words:
-                        sub_str = ' '.join(sub_words)
-                        curr_str = sub_str
-                else:
-                    curr_str = clause
+                curr_str = cl
 
         if curr_str:
             c_start = text.find(curr_str, sub_start)
@@ -444,10 +489,28 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             try:
                 if item is None:
                     return
-                # Wait for the background model load/warm-up before touching
-                # the ONNX session. Speech queued in the meantime is deferred,
-                # not dropped, and NVDA's main thread stays responsive.
+                if item.generation != self._currentGeneration():
+                    continue
+
+                full_text = item.full_text
+                spans = item.spans
+                if not full_text and not spans:
+                    continue
+
+                # Tier-0 Fast Disk Cache Check:
+                # If this UI phrase is already cached on disk (e.g. tray menu, desktop icons),
+                # emit audio IMMEDIATELY without waiting for the ONNX model to finish loading!
+                fast_pcm = self._getFromFastDiskCache(full_text, item.voice, item.volume)
+                if fast_pcm is not None:
+                    if item.generation == self._currentGeneration():
+                        self._isSpeakingEvent.set()
+                        first_idx = spans[0][2] if spans else None
+                        self._audioQueue.put(_AudioPacket(item.generation, fast_pcm, first_idx, False, True))
+                    continue
+
+                wait_t0 = time.perf_counter()
                 self._ready.wait()
+                log.debug(f"Kokoro synthesis waited {time.perf_counter() - wait_t0:.2f}s for model ready")
                 if self._stopEvent.is_set():
                     return
                 if self._tts is None:
@@ -456,11 +519,6 @@ class SynthDriver(synthDriverHandler.SynthDriver):
                     continue
                 if item.voice != self._tts.current_voice:
                     self._tts.set_voice(item.voice)
-
-                full_text = item.full_text
-                spans = item.spans
-                if not full_text and not spans:
-                    continue
 
                 utterance_t0 = time.perf_counter()
                 self._isSpeakingEvent.set()
@@ -474,24 +532,32 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 
                     pcm_bytes = b""
                     if chunk_str and chunk_str.strip():
-                        chunk_t0 = time.perf_counter()
-                        try:
-                            # Never run inference concurrently with the background
-                            # label precacher: on a 4-core/8-thread laptop, two
-                            # simultaneous 2-thread ONNX runs compete for the same
-                            # cores and each becomes several times slower.
-                            with self._inferenceLock:
-                                audio = self._tts.synthesize(chunk_str, speed=self._speedForRate(item.rate))
-                            if item.generation != self._currentGeneration() or self._stopEvent.is_set():
-                                break
-                            is_last = (chunk_idx == num_chunks - 1)
-                            pcm_bytes = self._toPcm16(audio, item.volume, trim_tail=not is_last)
-                        except Exception:
-                            log.debugWarning("Kokoro skipped unsynthesizable chunk", exc_info=True)
-                        log.debug(
-                            f"Kokoro chunk {chunk_idx} {chunk_str!r} took {time.perf_counter() - chunk_t0:.3f}s "
-                            f"({len(pcm_bytes) // 2 / 24000:.2f}s audio)"
-                        )
+                        # Check fast disk cache for this chunk
+                        chunk_fast_pcm = self._getFromFastDiskCache(chunk_str, item.voice, item.volume)
+                        if chunk_fast_pcm is not None:
+                            pcm_bytes = chunk_fast_pcm
+                        else:
+                            chunk_t0 = time.perf_counter()
+                            try:
+                                self._setThreadNormal()
+                                with self._inferenceLock:
+                                    if item.generation != self._currentGeneration() or self._stopEvent.is_set():
+                                        break
+                                    audio = self._tts.synthesize(chunk_str, speed=self._speedForRate(item.rate))
+                                if item.generation != self._currentGeneration() or self._stopEvent.is_set():
+                                    break
+                                is_first = (chunk_idx == 0)
+                                is_last = (chunk_idx == num_chunks - 1)
+                                pcm_bytes = self._toPcm16(audio, item.volume, trim_leading=not is_first, trim_tail=not is_last)
+                            except Exception:
+                                log.debugWarning("Kokoro skipped unsynthesizable chunk", exc_info=True)
+                            finally:
+                                self._setThreadBelowNormal()
+                            elapsed = time.perf_counter() - chunk_t0
+                            log.debug(
+                                f"Kokoro chunk {chunk_idx} {chunk_str!r} took {elapsed:.3f}s "
+                                f"({len(pcm_bytes) // 2 / 24000:.2f}s audio)"
+                            )
 
                     if item.generation != self._currentGeneration() or self._stopEvent.is_set():
                         break
@@ -504,11 +570,11 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 
                     total_chunk_chars = max(1, len(chunk_str))
                     total_pcm_len = len(pcm_bytes)
+                    is_last_chunk = (chunk_idx == num_chunks - 1)
 
-                    if pcm_bytes:
+                    if (pcm_bytes or is_last_chunk) and item.generation == self._currentGeneration():
                         first_idx = chunk_spans[0][2] if chunk_spans else None
-                        is_last_chunk = (chunk_idx == num_chunks - 1)
-                        self._audioQueue.put(_AudioPacket(item.generation, pcm_bytes, first_idx, False, is_last_chunk))
+                        self._audioQueue.put(_AudioPacket(item.generation, pcm_bytes if pcm_bytes else None, first_idx, False, is_last_chunk))
                         # Yield CPU slice to playback worker so WASAPI sound card output starts immediately
                         time.sleep(0.015)
             except Exception:
@@ -516,6 +582,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
             finally:
                 if self._speechQueue.empty():
                     self._isSpeakingEvent.clear()
+                    self._setThreadBelowNormal()
                 self._speechQueue.task_done()
 
     def _notifyIndexIfCurrent(self, generation: int, index: int) -> None:
@@ -530,37 +597,98 @@ class SynthDriver(synthDriverHandler.SynthDriver):
 
     def _runPlayback(self) -> None:
         self._setThreadBelowNormal()
+        CHUNK_SIZE = 4800  # 100ms at 24kHz 16-bit mono
         while not self._stopEvent.is_set():
             packet = self._audioQueue.get()
             try:
                 if packet is None:
                     return
                 if packet.generation != self._currentGeneration():
+                    if packet.isLastChunk:
+                        self._notifyDoneIfCurrent(packet.generation, packet.index)
                     continue
                 if packet.pcm:
+                    pcm = packet.pcm
+                    total_len = len(pcm)
+                    offset = 0
+                    while offset < total_len and not self._stopEvent.is_set():
+                        if packet.generation != self._currentGeneration():
+                            if packet.isLastChunk:
+                                self._notifyDoneIfCurrent(packet.generation, packet.index)
+                            break
+
+                        chunk = pcm[offset : offset + CHUNK_SIZE]
+                        offset += len(chunk)
+                        is_final_slice = (offset >= total_len) and packet.isLastChunk
+
+                        with self._playerLock:
+                            if packet.generation != self._currentGeneration():
+                                if packet.isLastChunk:
+                                    self._notifyDoneIfCurrent(packet.generation, packet.index)
+                                break
+                            try:
+                                if is_final_slice:
+                                    self._player.feed(
+                                        chunk,
+                                        onDone=lambda generation=packet.generation, index=packet.index: self._notifyDoneIfCurrent(
+                                            generation,
+                                            index,
+                                        ),
+                                    )
+                                elif packet.index is not None and is_final_slice:
+                                    self._player.feed(
+                                        chunk,
+                                        onDone=lambda generation=packet.generation, index=packet.index: self._notifyIndexIfCurrent(
+                                            generation,
+                                            index,
+                                        ),
+                                    )
+                                else:
+                                    self._player.feed(chunk)
+                            except Exception:
+                                log.exception("Kokoro WavePlayer feed failed, recreating player handle")
+                                try:
+                                    self._player.close()
+                                except Exception:
+                                    pass
+                                self._player = nvwave.WavePlayer(
+                                    channels=1,
+                                    samplesPerSec=24000,
+                                    bitsPerSample=16,
+                                    outputDevice=config.conf["audio"]["outputDevice"],
+                                )
+                                if packet.generation == self._currentGeneration():
+                                    if is_final_slice:
+                                        self._player.feed(
+                                            chunk,
+                                            onDone=lambda generation=packet.generation, index=packet.index: self._notifyDoneIfCurrent(
+                                                generation,
+                                                index,
+                                            ),
+                                        )
+                                    else:
+                                        self._player.feed(chunk)
+
+                        # Pace audio feed so hardware buffer holds at most ~100ms ahead,
+                        # allowing instant (<50ms) abrupt cancellation on cursor movement.
+                        if offset < total_len:
+                            target_sleep = len(chunk) / 48000.0 * 0.70
+                            sleep_end = time.perf_counter() + target_sleep
+                            while time.perf_counter() < sleep_end and not self._stopEvent.is_set():
+                                if packet.generation != self._currentGeneration():
+                                    break
+                                time.sleep(0.015)
+                else:
                     if packet.isLastChunk:
-                        self._player.feed(
-                            packet.pcm,
-                            onDone=lambda generation=packet.generation, index=packet.index: self._notifyDoneIfCurrent(
-                                generation,
-                                index,
-                            ),
-                        )
+                        self._notifyDoneIfCurrent(packet.generation, packet.index)
                     elif packet.index is not None:
-                        self._player.feed(
-                            packet.pcm,
-                            onDone=lambda generation=packet.generation, index=packet.index: self._notifyIndexIfCurrent(
-                                generation,
-                                index,
-                            ),
-                        )
-                    else:
-                        self._player.feed(packet.pcm)
+                        self._notifyIndexIfCurrent(packet.generation, packet.index)
             except Exception:
                 log.exception("Kokoro playback worker failed")
                 if packet is not None and packet.generation == self._currentGeneration():
                     try:
-                        self._player.stop()
+                        with self._playerLock:
+                            self._player.stop()
                     except Exception:
                         pass
                     synthDriverHandler.synthDoneSpeaking.notify(synth=self)
@@ -596,6 +724,7 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         full_text, spans = self._parseSequence(speechSequence)
         if not full_text and not spans:
             return
+        log.debug(f"Kokoro speak() queued {len(full_text)} chars: {full_text[:60]!r}")
         # Signal real speech immediately so the background label precacher stops
         # starting new inferences instead of competing with the user's read.
         self._isSpeakingEvent.set()
@@ -603,16 +732,22 @@ class SynthDriver(synthDriverHandler.SynthDriver):
         self._speechQueue.put(_Utterance(full_text, spans, self._rate, self._volume, self._voice, generation))
 
     def cancel(self):
-        self._nextGeneration()
-        self._discardQueue(self._speechQueue)
-        self._discardQueue(self._audioQueue)
-        try:
-            self._player.stop()
-        except Exception:
-            log.debugWarning("Kokoro could not stop audio", exc_info=True)
+        with self._playerLock:
+            self._nextGeneration()
+            self._discardQueue(self._speechQueue)
+            self._discardQueue(self._audioQueue)
+            self._isSpeakingEvent.clear()
+            try:
+                self._player.stop()
+            except Exception:
+                log.debugWarning("Kokoro could not stop audio", exc_info=True)
 
     def pause(self, switch):
-        self._player.pause(bool(switch))
+        with self._playerLock:
+            try:
+                self._player.pause(bool(switch))
+            except Exception:
+                pass
 
     def reloadVoices(self):
         self._knownVoices = self._scanVoiceFiles(self._userVoiceDir)
