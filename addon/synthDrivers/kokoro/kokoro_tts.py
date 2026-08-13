@@ -52,52 +52,79 @@ class KokoroTTS:
         with open(tokenizer_path, 'r', encoding='utf-8') as f:
             self.tokenizer_config = json.load(f)
 
-        # Initialize phonemizer
+        # Initialize phonemizer and ONNX session in parallel. On Windows the
+        # first load of libespeak-ng.dll after a boot can be held up for several
+        # seconds by antivirus scanning, while the ONNX session creation is
+        # disk + CPU bound. Overlapping the two shaves ~2s off the cold-start
+        # model load instead of paying them sequentially.
         self.phonemizer = None
         self.use_phonemizer = False
+        phonemizer_result: dict = {}
 
-        # Always try to use the phonemizer for clear English speech
-        if KOKORO_PHONEMIZER_AVAILABLE:
+        def _init_phonemizer() -> None:
+            t0 = time.perf_counter()
             try:
-                self.phonemizer = KokoroPhonemizer(language=language)
-                self.use_phonemizer = True
+                phonemizer_result["ph"] = KokoroPhonemizer(language=language)
+                phonemizer_result["espeak_time"] = time.perf_counter() - t0
             except Exception as e:
-                raise RuntimeError(f"Failed to initialize phonemizer: {e}")
+                phonemizer_result["err"] = e
+                phonemizer_result["espeak_time"] = time.perf_counter() - t0
+
+        phonemizer_thread = None
+        if KOKORO_PHONEMIZER_AVAILABLE:
+            phonemizer_thread = threading.Thread(target=_init_phonemizer, daemon=True)
+            phonemizer_thread.start()
         else:
-            raise RuntimeError("Phonemizer not available. Cannot initialize TTS without eSpeak-NG.")
+            phonemizer_result["err"] = RuntimeError(
+                "Phonemizer not available. Cannot initialize TTS without eSpeak-NG."
+            )
 
         session_options = ort.SessionOptions()
         session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         session_options.inter_op_num_threads = 1
-        # On a low-core-count laptop (4 physical cores) the model is fast enough
-        # with 2 threads *when cool*, but sustained article reading pushes two
-        # cores into thermal throttling and each inference degrades severely
-        # (measured: a single sentence went from ~14s to ~23s after a few
-        # back-to-back runs). Spreading the work over 4 threads keeps clock
-        # speeds sustainable and gives stable, faster throughput for continuous
-        # reading.
+        # Spreading matrix multiplication across up to 4 threads gives fast
+        # vector throughput while session.intra_op.allow_spinning = 0 prevents
+        # thread busy-waiting and thermal power throttling when idle.
         session_options.intra_op_num_threads = min(4, os.cpu_count() or 4)
         session_options.enable_mem_pattern = True
         session_options.enable_cpu_mem_arena = True
+        try:
+            # Disable busy-wait thread spinning so threads sleep immediately when idle
+            session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        except Exception:
+            pass
 
         # Force CPUExecutionProvider. DirectML (DmlExecutionProvider) triggers 13-second DirectX 12 HLSL shader JIT compilation delays on Intel integrated GPUs.
         providers = ['CPUExecutionProvider']
 
+        session_t0 = time.perf_counter()
         self.session = ort.InferenceSession(
             model_path,
             sess_options=session_options,
             providers=providers,
         )
+        session_time = time.perf_counter() - session_t0
+
+        if phonemizer_thread is not None:
+            phonemizer_thread.join()
+        if "err" in phonemizer_result:
+            raise RuntimeError(f"Failed to initialize phonemizer: {phonemizer_result['err']}")
+        if "ph" in phonemizer_result:
+            self.phonemizer = phonemizer_result["ph"]
+            self.use_phonemizer = True
+        else:
+            raise RuntimeError("Phonemizer not available. Cannot initialize TTS without eSpeak-NG.")
 
         # Get input and output names
         self.input_names = [input.name for input in self.session.get_inputs()]
         self.output_names = [output.name for output in self.session.get_outputs()]
 
-        pass
-        pass
         # Load available voices
+        voice_t0 = time.perf_counter()
         self.voices = self._load_available_voices()
+        voice_time = time.perf_counter() - voice_t0
         self.current_voice = None
         if self.voices:
             self.current_voice = list(self.voices.keys())[0]  # Default to first voice
@@ -113,17 +140,20 @@ class KokoroTTS:
         self._disk_cache_dir = None
         self._init_disk_cache()
 
-        # Warm the ONNX session now so the expensive one-time lazy
-        # initialization (thread pool spin-up, kernel selection, memory arena
-        # allocation) is paid during NVDA startup instead of during the user's
-        # first read. This is synchronous so the model is guaranteed warm before
-        # any speech is requested; on slow hardware it costs a few seconds once.
+        # No explicit warm-up: the first inference's one-time ONNX initialization
+        # (thread pool spin-up, kernel selection) is paid on the first novel
+        # synthesis instead. Warming here would block the model from becoming
+        # ready (and delay every cached label) for ~6s on a cold CPU, while
+        # cached labels never need inference anyway.
         self._warmup_done = False
-        try:
-            self._warmup()
-        except Exception:
-            if log is not None:
-                log.debugWarning("Kokoro model warm-up failed", exc_info=True)
+
+        if log is not None:
+            log.info(
+                "Kokoro init breakdown: espeak=%.2fs session=%.2fs voices=%.2fs warmup=0.00s",
+                phonemizer_result.get("espeak_time", -1.0),
+                session_time,
+                voice_time,
+            )
 
     def _warmup(self) -> None:
         """Run one tiny inference to force ONNX Runtime lazy initialization.
@@ -135,13 +165,14 @@ class KokoroTTS:
             return
         if not self.voices or not self.current_voice:
             return
+        t0 = time.perf_counter()
         start_id = self.tokenizer_config["model"]["vocab"]["$"]
         # Use a realistic token count (like a typical screen-reader chunk) so
         # ONNX Runtime performs its shape-dependent memory planning for the
         # sizes that will actually be used at read time, not just tiny inputs.
         # 16 tokens (~1.8s here) is a good balance: enough to trigger the
         # realistic memory layout, but bounded so it doesn't slow NVDA startup.
-        tokens = np.array([[start_id] * 16], dtype=np.int64)
+        tokens = np.array([[start_id] * 8], dtype=np.int64)
         voice_bank = self.voices[self.current_voice]
         style_index = min(max(0, len(tokens) - 2), voice_bank.shape[0] - 1)
         voice_embedding = voice_bank[style_index]
@@ -153,6 +184,8 @@ class KokoroTTS:
         }
         self.session.run(None, inputs)
         self._warmup_done = True
+        if log is not None:
+            log.info("Kokoro ONNX engine background warm-up completed in %.2fs", time.perf_counter() - t0)
 
     def _init_disk_cache(self) -> None:
         self._disk_cache_dir = None
@@ -482,13 +515,9 @@ class KokoroTTS:
     @staticmethod
     def _normalizeCacheKey(text: str) -> str:
         s = text.strip().lower()
-        s = re.sub(r'[\.\…\:\,\;\!\?\/]+', '', s)
-        for _ in range(3):
-            s = re.sub(r'\s+sub\s+menu\s+[a-z0-9]$', '', s)
-            s = re.sub(r'\s+menu\s+[a-z0-9]$', '', s)
-            s = re.sub(r'\s+sub\s+menu$', '', s)
-            s = re.sub(r'\s+menu$', '', s)
-        return re.sub(r'\s+', ' ', s).strip()
+        s = re.sub(r'[\.\…\:\,\;\!\?\/]+', ' ', s)
+        s = re.sub(r'\s+', ' ', s).strip()
+        return s if s else text.strip().lower()
 
     def synthesize(self, text: str, speed: float = None) -> np.ndarray:
         """
@@ -512,14 +541,16 @@ class KokoroTTS:
         cache_key = (norm_key, self.current_voice)
         disk_key = f"{norm_key}:{self.current_voice}"
 
-        if len(norm_key) <= 300:
+        if len(norm_key) <= 300 and norm_key:
             # Tier 1: Check RAM Cache (0.00 ms)
             if cache_key in self._synth_cache:
-                return self._synth_cache[cache_key]
+                cached_wav = self._synth_cache[cache_key]
+                if cached_wav is not None and len(cached_wav) > 0:
+                    return cached_wav
 
             # Tier 2: Check Persistent Binary Disk Cache (0.01 ms)
             disk_wav = self._get_from_disk_cache(disk_key)
-            if disk_wav is not None:
+            if disk_wav is not None and len(disk_wav) > 0:
                 self._synth_cache[cache_key] = disk_wav
                 return disk_wav
 
@@ -550,7 +581,7 @@ class KokoroTTS:
         outputs = self.session.run(None, inputs)
         waveform = np.asarray(outputs[0].squeeze(), dtype=np.float32)
 
-        if len(norm_key) <= 300:
+        if len(norm_key) <= 300 and norm_key and len(waveform) > 0:
             if len(self._synth_cache) >= self._synth_cache_max:
                 self._synth_cache.clear()
             self._synth_cache[cache_key] = waveform
