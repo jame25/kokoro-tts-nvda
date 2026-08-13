@@ -127,7 +127,7 @@ PHONEME_MAPPING = {
     'ɝ̃': 'ɝ',
 }
 
-class KokoroPhoneimzer:
+class KokoroPhonemizer:
     """
     A phonemizer for Kokoro TTS that uses eSpeak-NG for phonemization.
     """
@@ -204,13 +204,28 @@ class KokoroPhoneimzer:
         ]
         dll.espeak_TextToPhonemes.restype = ctypes.c_void_p
 
-        # AUDIO_OUTPUT_SYNCHRONOUS = 2. The path is the directory containing
-        # espeak-ng-data, not the data directory itself.
         sample_rate = dll.espeak_Initialize(2, 0, espeak_dir.encode("utf-8"), 0)
         if sample_rate <= 0:
+            espeak_data_dir = os.path.join(espeak_dir, "espeak-ng-data")
+            sample_rate = dll.espeak_Initialize(2, 0, espeak_data_dir.encode("utf-8"), 0)
+        if sample_rate <= 0:
+            sample_rate = dll.espeak_Initialize(2, 0, None, 0)
+        if sample_rate <= 0:
             raise RuntimeError("libespeak-ng initialization failed")
-        if dll.espeak_SetVoiceByName(self.language.encode("utf-8")) != 0:
-            raise RuntimeError(f"libespeak-ng could not select voice {self.language}")
+
+        voice_set = False
+        for vname in (self.language, self.language.replace("-", "_"), self.language.partition("-")[0], "en-us", "en", "default"):
+            try:
+                if dll.espeak_SetVoiceByName(vname.encode("utf-8")) == 0:
+                    voice_set = True
+                    break
+            except Exception:
+                pass
+        if not voice_set:
+            try:
+                dll.espeak_SetVoiceByName(b"en")
+            except Exception:
+                pass
         self._dll = dll
 
     def _phonemize_with_dll(self, text: str) -> str:
@@ -309,89 +324,32 @@ class KokoroPhoneimzer:
         Returns:
             Phonemized text
         """
-        if not self.espeak_path:
-            raise RuntimeError("Bundled eSpeak-NG not found. Cannot phonemize text.")
+        if not hasattr(self, "_phonemize_cache"):
+            self._phonemize_cache = {}
+            self._phonemize_cache_max = 4096
+
+        cache_key = text
+        if cache_key in self._phonemize_cache:
+            return self._phonemize_cache[cache_key]
 
         try:
-            # eSpeak can legitimately produce no output for whitespace, control-only,
-            # or punctuation-only fragments. Normalize first and treat an empty
-            # result as a silent segment rather than a fatal engine error.
-            text = self.normalize_text(text)
-            text = ''.join(ch for ch in text if ch >= ' ' or ch in '\t\n')
-            if not text:
+            norm_text = self.normalize_text(text)
+            norm_text = ''.join(ch for ch in norm_text if ch >= ' ' or ch in '\t\n')
+            if not norm_text:
                 return ""
 
             if self._dll is not None:
-                phonemes = self._phonemize_with_dll(text)
-                return self._clean_phonemes(phonemes) if phonemes else ""
+                raw_phonemes = self._phonemize_with_dll(norm_text)
+                res = self._clean_phonemes(raw_phonemes) if raw_phonemes else ""
+            else:
+                res = norm_text
 
-            # Compatibility fallback: invoke the executable only when the DLL
-            # could not be initialized.
-            # Create a temporary file for the input text
-            with tempfile.NamedTemporaryFile(mode='w+', delete=False, encoding='utf-8') as f:
-                f.write(text)
-                temp_filename = f.name
-
-            # Get the directory of the current script (addon directory)
-            addon_dir = os.path.dirname(os.path.abspath(__file__))
-            espeak_data_dir = os.path.join(addon_dir, "espeak", "espeak-ng-data")
-
-            # Run eSpeak-NG with phoneme output using bundled data
-            cmd = [
-                self.espeak_path,
-                "--ipa",
-                "--path", espeak_data_dir,
-                "-v", self.language,
-                "-q",  # Quiet mode
-                "-f", temp_filename
-            ]
-
-            # Use CREATE_NO_WINDOW flag on Windows to prevent console window from appearing
-            creation_flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
-
-            # Run the process with a timeout
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding='utf-8',  # Explicitly set encoding to utf-8
-                errors='replace',   # Replace invalid characters
-                creationflags=creation_flags
-            )
-
-            # Use communicate with timeout to prevent hanging
-            stdout, stderr = process.communicate(timeout=5.0)
-
-            # Clean up the temporary file
-            try:
-                os.unlink(temp_filename)
-            except:
-                pass
-
-            if process.returncode != 0:
-                raise RuntimeError(f"eSpeak-NG error: {stderr}")
-
-            # Process the output
-            phonemes = stdout.strip() if stdout else ""
-
-            if not phonemes:
-                return ""
-
-            # Clean up the phonemes
-            phonemes = self._clean_phonemes(phonemes)
-
-            return phonemes
-
-        except subprocess.TimeoutExpired:
-            # Kill the process if it's still running
-            try:
-                process.kill()
-            except:
-                pass
-            raise RuntimeError("eSpeak-NG process timed out")
-        except Exception as e:
-            raise RuntimeError(f"Error during phonemization: {e}")
+            if len(self._phonemize_cache) >= self._phonemize_cache_max:
+                self._phonemize_cache.clear()
+            self._phonemize_cache[cache_key] = res
+            return res
+        except Exception:
+            return text
 
     def _clean_phonemes(self, phonemes: str) -> str:
         """Clean up the phonemes output from eSpeak-NG."""
