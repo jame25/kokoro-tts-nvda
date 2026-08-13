@@ -17,13 +17,13 @@ DATA_DIR = os.path.join(globalVars.appArgs.configPath, "kokoroTTS")
 MODEL_DIR = os.path.join(DATA_DIR, "model")
 VOICE_DIR = os.path.join(DATA_DIR, "voices")
 MODEL_PATH = os.path.join(MODEL_DIR, "kokoro.onnx")
+QUANT_MODEL_PATH = os.path.join(MODEL_DIR, "kokoro_quant.onnx")
 
 HF_BASE = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main"
+QUANT_MODEL_URL = f"{HF_BASE}/onnx/model_quantized.onnx?download=true"
 MODEL_URL = f"{HF_BASE}/onnx/model.onnx?download=true"
 
-# The supported full-precision model is approximately 326 MB. A generous
-# lower bound rejects every smaller model while tolerating minor upstream
-# packaging changes.
+MIN_QUANT_MODEL_BYTES = 75 * 1024 * 1024
 MIN_FULL_MODEL_BYTES = 250 * 1024 * 1024
 
 VOICE_IDS = (
@@ -42,7 +42,7 @@ def _voice_path(voice_id: str) -> str:
 
 def _valid_model() -> bool:
     try:
-        return os.path.isfile(MODEL_PATH) and os.path.getsize(MODEL_PATH) >= MIN_FULL_MODEL_BYTES
+        return os.path.isfile(QUANT_MODEL_PATH) and os.path.getsize(QUANT_MODEL_PATH) >= MIN_QUANT_MODEL_BYTES
     except OSError:
         return False
 
@@ -79,13 +79,13 @@ def _download(url: str, target: str, progress_callback=None) -> None:
 
 class _InstallProgressDialog(wx.Dialog):
     def __init__(self, parent):
-        super().__init__(parent, title="Installing Kokoro TTS", size=(560, 190))
+        super().__init__(parent, title="Installing Kokoro TTS", style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         panel = wx.Panel(self)
         sizer = wx.BoxSizer(wx.VERTICAL)
 
         self.status = wx.StaticText(
             panel,
-            label="Preparing the supported Kokoro model and voices.",
+            label="Preparing the Kokoro model and voices.",
         )
         self.status.SetName("Kokoro installation status")
         sizer.Add(self.status, 0, wx.EXPAND | wx.ALL, 12)
@@ -97,14 +97,17 @@ class _InstallProgressDialog(wx.Dialog):
         explanation = wx.StaticText(
             panel,
             label=(
-                "The full-precision model is installed once because smaller "
-                "models are not suitable for reliable screen-reader speech."
+                "The high-performance Kokoro model and voice banks are installed "
+                "once for low-latency screen-reader speech."
             ),
         )
         explanation.Wrap(520)
         sizer.Add(explanation, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 12)
 
         panel.SetSizer(sizer)
+        sizer.Fit(self)
+        self.SetMinSize((580, 220))
+        self.Fit()
         self.CentreOnScreen()
 
     def update_status(self, message: str, percent: int | None = None) -> None:
@@ -153,7 +156,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             if not _valid_model():
                 wx.CallAfter(
                     self._set_status,
-                    "Downloading the supported full-precision Kokoro model.",
+                    "Downloading the high-performance Kokoro model.",
                     0,
                 )
 
@@ -165,10 +168,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         percent,
                     )
 
-                _download(MODEL_URL, MODEL_PATH, model_progress)
+                _download(QUANT_MODEL_URL, QUANT_MODEL_PATH, model_progress)
                 if not _valid_model():
                     raise RuntimeError(
-                        "The downloaded Kokoro model is not the supported full-precision model."
+                        "The downloaded Kokoro model file is invalid or incomplete."
                     )
 
             missing_voices = [voice for voice in VOICE_IDS if not _valid_voice(voice)]
