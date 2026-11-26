@@ -26,6 +26,11 @@ MODEL_URL = f"{HF_BASE}/onnx/model.onnx?download=true"
 MIN_QUANT_MODEL_BYTES = 75 * 1024 * 1024
 MIN_FULL_MODEL_BYTES = 250 * 1024 * 1024
 
+# Approximate download sizes shown in the consent prompt (decimal megabytes).
+# Each voice bank is 510 x 256 float32 values (522,240 bytes).
+APPROX_QUANT_MODEL_MB = 92.0
+APPROX_VOICE_MB = 0.52
+
 VOICE_IDS = (
     "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore",
     "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
@@ -54,6 +59,36 @@ def _valid_voice(voice_id: str) -> bool:
     except OSError:
         return False
     return size >= (256 * 4) and size % (256 * 4) == 0
+
+
+def _missing_voices() -> list[str]:
+    return [voice for voice in VOICE_IDS if not _valid_voice(voice)]
+
+
+def _format_mb(megabytes: float) -> str:
+    return f"about {max(1, round(megabytes))} MB"
+
+
+def _consent_message(need_model: bool, missing_voices: list[str]) -> str:
+    items = []
+    total_mb = 0.0
+    if need_model:
+        items.append(f"- The Kokoro speech model ({_format_mb(APPROX_QUANT_MODEL_MB)})")
+        total_mb += APPROX_QUANT_MODEL_MB
+    if missing_voices:
+        voices_mb = len(missing_voices) * APPROX_VOICE_MB
+        noun = "voice" if len(missing_voices) == 1 else "voices"
+        items.append(f"- {len(missing_voices)} {noun} ({_format_mb(voices_mb)})")
+        total_mb += voices_mb
+    return (
+        "Kokoro TTS needs to download the following files before it can speak:\n\n"
+        + "\n".join(items)
+        + f"\n\nTotal download: {_format_mb(total_mb)} from Hugging Face (huggingface.co). "
+        "The files are saved in your NVDA configuration folder.\n\n"
+        "Do you want to download them now?\n\n"
+        "If you choose No, nothing will be downloaded. "
+        "You will be asked again the next time NVDA starts."
+    )
 
 
 def _download(url: str, target: str, progress_callback=None) -> None:
@@ -129,9 +164,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
     def _start_if_needed(self) -> None:
         if self._terminating:
             return
-        missing_voices = [voice for voice in VOICE_IDS if not _valid_voice(voice)]
-        if _valid_model() and not missing_voices:
+        need_model = not _valid_model()
+        missing_voices = _missing_voices()
+        if not need_model and not missing_voices:
             log.info("Kokoro one-time installation is complete")
+            return
+        if globalVars.appArgs.secure:
+            # Never prompt for, or start, a download on a secure screen.
+            log.info("Kokoro model or voices missing; skipping download prompt on secure screen")
+            return
+
+        # Ask before downloading anything (GitHub issue #2).
+        answer = gui.messageBox(
+            _consent_message(need_model, missing_voices),
+            "Kokoro TTS: download model and voices?",
+            wx.YES_NO | wx.ICON_QUESTION,
+        )
+        if self._terminating:
+            return
+        if answer != wx.YES:
+            log.info("Kokoro model/voice download declined by the user; will ask again on next NVDA start")
             return
 
         self._dialog = _InstallProgressDialog(gui.mainFrame)
@@ -174,7 +226,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
                         "The downloaded Kokoro model file is invalid or incomplete."
                     )
 
-            missing_voices = [voice for voice in VOICE_IDS if not _valid_voice(voice)]
+            missing_voices = _missing_voices()
             total_voices = len(missing_voices)
             for number, voice_id in enumerate(missing_voices, 1):
                 display_name = voice_id.partition("_")[2].replace("_", " ").title()
@@ -225,7 +277,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
             (
                 "Kokoro could not finish installing its model and voices.\n\n"
                 f"{error}\n\n"
-                "NVDA will try again the next time it starts."
+                "You will be asked again the next time NVDA starts."
             ),
             "Kokoro TTS",
             wx.OK | wx.ICON_ERROR,
